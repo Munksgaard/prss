@@ -1,0 +1,19 @@
+[package]
+name = "prss"
+version = "0.1.0"
+authors = ["Philip Munksgaard <philip@munksgaard.me>"]
+edition = "2018"
+
+[dependencies]
+tui = "0.14"
+termion = "1.5"
+reqwest = { version = "0.11", features = ["json"] }
+tokio = { version = "1", features = ["full"] }
+futures = "0.3.12"
+atom_syndication = { version = "0.9", features = ["with-serde"] }
+rss = "1.10"
+structopt = { version = "0.3", features = ["paw"] }
+paw = "1.0"
+anyhow = "1.0"
+xdg = "2.2.0"
+chrono = "0.4.19"
