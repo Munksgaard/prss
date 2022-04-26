@@ -17,17 +17,17 @@ use tui::widgets::{Block, Borders, List, ListItem, ListState};
 use tui::Terminal;
 
 enum Entry {
-    Atom(Box<atom::Entry>),
-    Rss(Box<rss::Item>),
+    Atom(String, Box<atom::Entry>),
+    Rss(String, Box<rss::Item>),
 }
 
 impl Entry {
-    fn title(&self) -> Option<&str> {
+    fn title(&self) -> Option<String> {
         use Entry::*;
 
         match self {
-            Atom(entry) => Some(&entry.title),
-            Rss(item) => item.title(),
+            Atom(source, entry) => Some(format!("{} ({})", entry.title, source)),
+            Rss(source, item) => item.title().map(|t| format!("{} ({})", t, source)),
         }
     }
 
@@ -35,8 +35,8 @@ impl Entry {
         use Entry::*;
 
         match self {
-            Atom(entry) => entry.published,
-            Rss(item) => item
+            Atom(_, entry) => entry.published,
+            Rss(_, item) => item
                 .pub_date
                 .as_ref()
                 .and_then(|d| chrono::DateTime::parse_from_rfc2822(d).ok()),
@@ -47,8 +47,8 @@ impl Entry {
         use Entry::*;
 
         match self {
-            Atom(entry) => entry.links.first().map(|x| x.href.as_ref()),
-            Rss(item) => item.link.as_ref().map(|x| x.as_ref()),
+            Atom(_, entry) => entry.links.first().map(|x| x.href.as_ref()),
+            Rss(_, item) => item.link.as_ref().map(|x| x.as_ref()),
         }
     }
 }
@@ -125,15 +125,17 @@ async fn main() -> Result<()> {
         let content = reqwest::get(&url).await?.bytes().await?;
 
         let mut res: Vec<_> = if let Ok(feed) = atom::Feed::read_from(&content[..]) {
+            let t = feed.title.clone();
             feed.entries
                 .into_iter()
-                .map(|e| Entry::Atom(Box::new(e)))
+                .map(move |e| Entry::Atom(t.clone(), Box::new(e)))
                 .collect()
         } else if let Ok(channel) = rss::Channel::read_from(&content[..]) {
+            let t = channel.title.clone();
             channel
                 .items
                 .into_iter()
-                .map(|i| Entry::Rss(Box::new(i)))
+                .map(move |i| Entry::Rss(t.clone(), Box::new(i)))
                 .collect()
         } else {
             panic!("Couldn't read Atom or RSS from input.")
@@ -158,7 +160,7 @@ async fn main() -> Result<()> {
             let items: Vec<ListItem> = feedlist
                 .items
                 .iter()
-                .map(|i| ListItem::new(i.title().unwrap_or("")))
+                .map(|i| ListItem::new(i.title().unwrap_or_else(|| String::from(""))))
                 .collect();
 
             let items = List::new(items)
