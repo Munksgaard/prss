@@ -6,6 +6,7 @@ use std::process::Command;
 use anyhow::{anyhow, bail, Context, Result};
 use atom_syndication as atom;
 use chrono::{DateTime, FixedOffset};
+use futures::StreamExt;
 use termion::event::Key;
 use termion::input::TermRead;
 use termion::raw::IntoRawMode;
@@ -16,6 +17,7 @@ use tui::style::{Color, Style};
 use tui::widgets::{Block, Borders, List, ListItem, ListState};
 use tui::Terminal;
 
+#[derive(Clone)]
 enum Entry {
     Atom(String, Box<atom::Entry>),
     Rss(String, Box<rss::Item>),
@@ -164,10 +166,7 @@ async fn main() -> Result<()> {
         .place_config_file("feeds.txt")
         .expect("cannot create configuration directory");
     let feeds_txt = File::open(feeds_txt).context("feeds.txt")?;
-    let feed_urls: Vec<String> = BufReader::new(feeds_txt)
-        .lines()
-        .map(|l| l.unwrap())
-        .collect();
+    let feed_urls = BufReader::new(feeds_txt).lines().map(|l| l.unwrap());
 
     let screen = AlternateScreen::from(io::stdout().into_raw_mode()?);
     let stdin = io::stdin();
@@ -175,15 +174,19 @@ async fn main() -> Result<()> {
     let mut terminal = Terminal::new(backend)?;
     terminal.clear()?;
 
-    let mut entries = Vec::new();
-
     let client = reqwest::Client::new();
 
-    for url in feed_urls {
-        let mut feed_entries = get_feed_entries(&client, &url).await?;
-
-        entries.append(&mut feed_entries)
-    }
+    let fetches = futures::stream::iter(feed_urls.map(|url| {
+        let client = client.clone();
+        async move { get_feed_entries(&client, &url).await }
+    }))
+    .buffer_unordered(8)
+    .collect::<Vec<_>>()
+    .await;
+    let mut entries = fetches
+        .into_iter()
+        .collect::<Result<Vec<Vec<Entry>>>>()?
+        .concat();
 
     entries.sort_by_key(|x| x.date());
     entries.reverse();
