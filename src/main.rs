@@ -1,11 +1,11 @@
+use std::fs::{metadata, File};
+use std::io;
+use std::io::{BufRead, BufReader, Read, Write};
 use std::process::Command;
 
-use anyhow::{Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use atom_syndication as atom;
 use chrono::{DateTime, FixedOffset};
-use std::fs::File;
-use std::io;
-use std::io::{BufRead, BufReader};
 use termion::event::Key;
 use termion::input::TermRead;
 use termion::raw::IntoRawMode;
@@ -101,6 +101,62 @@ impl<T> FeedList<T> {
     }
 }
 
+fn read_feed(content: &[u8]) -> Result<Vec<Entry>> {
+    if let Ok(feed) = atom::Feed::read_from(content) {
+        let t = feed.title.clone();
+        Ok(feed
+            .entries
+            .into_iter()
+            .map(move |e| Entry::Atom(t.clone(), Box::new(e)))
+            .collect())
+    } else if let Ok(channel) = rss::Channel::read_from(content) {
+        let t = channel.title.clone();
+        Ok(channel
+            .items
+            .into_iter()
+            .map(move |i| Entry::Rss(t.clone(), Box::new(i)))
+            .collect())
+    } else {
+        bail!("Couldn't read Atom or RSS from input.")
+    }
+}
+
+async fn get_feed_entries(client: &reqwest::Client, url: &str) -> Result<Vec<Entry>> {
+    let digest = md5::compute(url);
+    let xdg_dirs = xdg::BaseDirectories::with_prefix("prss")?;
+    let cache_file = xdg_dirs.find_cache_file(format!("{:x}", digest));
+    let response = client.head(url).send().await?;
+    match (
+        cache_file
+            .ok_or_else(|| anyhow!("Cachefile not found"))
+            .and_then(|x| Ok((x.clone(), metadata(x).context("metadata")?)))
+            .and_then(|(y, x)| Ok((y, x.modified().context("modified")?))),
+        response
+            .headers()
+            .get(reqwest::header::LAST_MODIFIED)
+            .ok_or_else(|| anyhow!("No last_modified header found"))
+            .and_then(|x| x.to_str().context("to_str"))
+            .and_then(|x| DateTime::parse_from_rfc2822(x).context("parse_from_rfc2822")),
+    ) {
+        (Ok((cache, file_last_modified)), Ok(url_last_modified))
+            if file_last_modified >= std::convert::From::from(url_last_modified) =>
+        {
+            let mut handle = File::open(cache).context("open")?;
+            let mut buf = vec![];
+            handle.read_to_end(&mut buf)?;
+            read_feed(&buf[..])
+        }
+        _ => {
+            let content = reqwest::get(url).await?.bytes().await?;
+            let feed = read_feed(&content[..]);
+            let path = xdg_dirs.place_cache_file(format!("{:x}", digest))?;
+            let mut f = File::create(path)?;
+            f.write_all(&content[..])?;
+            feed
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let xdg_dirs = xdg::BaseDirectories::with_prefix("prss")?;
@@ -121,27 +177,12 @@ async fn main() -> Result<()> {
 
     let mut entries = Vec::new();
 
+    let client = reqwest::Client::new();
+
     for url in feed_urls {
-        let content = reqwest::get(&url).await?.bytes().await?;
+        let mut feed_entries = get_feed_entries(&client, &url).await?;
 
-        let mut res: Vec<_> = if let Ok(feed) = atom::Feed::read_from(&content[..]) {
-            let t = feed.title.clone();
-            feed.entries
-                .into_iter()
-                .map(move |e| Entry::Atom(t.clone(), Box::new(e)))
-                .collect()
-        } else if let Ok(channel) = rss::Channel::read_from(&content[..]) {
-            let t = channel.title.clone();
-            channel
-                .items
-                .into_iter()
-                .map(move |i| Entry::Rss(t.clone(), Box::new(i)))
-                .collect()
-        } else {
-            panic!("Couldn't read Atom or RSS from input.")
-        };
-
-        entries.append(&mut res)
+        entries.append(&mut feed_entries)
     }
 
     entries.sort_by_key(|x| x.date());
