@@ -5,8 +5,9 @@ use std::process::Command;
 
 use anyhow::{anyhow, bail, Context, Result};
 use atom_syndication as atom;
-use chrono::{DateTime, FixedOffset};
+use chrono::{DateTime, Utc};
 use futures::StreamExt;
+use itertools::process_results;
 use termion::event::Key;
 use termion::input::TermRead;
 use termion::raw::IntoRawMode;
@@ -18,50 +19,53 @@ use tui::widgets::{Block, Borders, List, ListItem, ListState};
 use tui::Terminal;
 
 #[derive(Clone)]
-enum Entry {
-    Atom(String, Box<atom::Entry>),
-    Rss(String, Box<rss::Item>),
+struct FeedEntry {
+    title: String,
+    url: String,
+    date: DateTime<Utc>,
 }
 
-impl Entry {
-    fn title(&self) -> Option<String> {
-        use Entry::*;
+struct Feed {
+    title: String,
+    entries: Vec<FeedEntry>,
+}
 
-        match self {
-            Atom(source, entry) => Some(format!("{} ({})", entry.title, source)),
-            Rss(source, item) => item.title().map(|t| format!("{} ({})", t, source)),
-        }
-    }
-
-    fn date(&self) -> Option<DateTime<FixedOffset>> {
-        use Entry::*;
-
-        match self {
-            Atom(_, entry) => entry.published,
-            Rss(_, item) => item
-                .pub_date
-                .as_ref()
-                .and_then(|d| chrono::DateTime::parse_from_rfc2822(d).ok()),
-        }
-    }
-
-    fn link(&self) -> Option<&str> {
-        use Entry::*;
-
-        match self {
-            Atom(_, entry) => entry.links.first().map(|x| x.href.as_ref()),
-            Rss(_, item) => item.link.as_ref().map(|x| x.as_ref()),
-        }
+impl Feed {
+    fn list_entries(&self) -> Vec<FeedListEntry> {
+        self.entries
+            .iter()
+            .map(|e| FeedListEntry {
+                title: format!("{} ({})", e.title, self.title),
+                url: e.url.clone(),
+                date: e.date,
+            })
+            .collect()
     }
 }
 
-struct FeedList<T> {
-    items: Vec<T>,
+#[derive(Clone)]
+struct FeedListEntry {
+    title: String,
+    url: String,
+    date: DateTime<Utc>,
+}
+
+struct FeedList {
+    items: Vec<FeedListEntry>,
     state: ListState,
 }
 
-impl<T> FeedList<T> {
-    fn new(items: Vec<T>) -> FeedList<T> {
+impl FeedList {
+    fn new(items: Vec<Feed>) -> FeedList {
+        let mut items = items
+            .iter()
+            .map(|e| e.list_entries())
+            .collect::<Vec<Vec<_>>>()
+            .concat();
+
+        items.sort_by_key(|x| x.date);
+        items.reverse();
+
         let mut state = ListState::default();
         if !items.is_empty() {
             state.select(Some(0));
@@ -98,32 +102,60 @@ impl<T> FeedList<T> {
         self.state.select(Some(i));
     }
 
-    pub fn get(&self) -> &T {
+    pub fn get(&self) -> &FeedListEntry {
         &self.items[self.state.selected().expect("impossible")]
     }
 }
 
-fn read_feed(content: &[u8]) -> Result<Vec<Entry>> {
+fn read_feed(url: &str, content: &[u8]) -> Result<Feed> {
     if let Ok(feed) = atom::Feed::read_from(content) {
-        let t = feed.title.clone();
-        Ok(feed
-            .entries
-            .into_iter()
-            .map(move |e| Entry::Atom(t.clone(), Box::new(e)))
-            .collect())
+        Ok(Feed {
+            title: feed.title().to_string(),
+            entries: feed
+                .entries
+                .into_iter()
+                .map(move |e| FeedEntry {
+                    title: e.title().to_string(),
+                    url: e.links().first().unwrap().href.clone(),
+                    date: DateTime::<Utc>::from(e.published.unwrap()),
+                })
+                .collect(),
+        })
     } else if let Ok(channel) = rss::Channel::read_from(content) {
         let t = channel.title.clone();
-        Ok(channel
-            .items
-            .into_iter()
-            .map(move |i| Entry::Rss(t.clone(), Box::new(i)))
-            .collect())
+        Ok(Feed {
+            title: channel.title.clone(),
+            entries: channel
+                .items
+                .into_iter()
+                .map(move |i| FeedEntry {
+                    title: i.title().unwrap_or("").to_string(),
+                    url: i.link().unwrap().to_string(),
+                    date: DateTime::<Utc>::from(
+                        i.pub_date
+                            .as_ref()
+                            .and_then(|d| {
+                                chrono::DateTime::parse_from_rfc2822(&d.replace("UTC", "+0000"))
+                                    .ok()
+                            })
+                            .unwrap_or_else(|| {
+                                panic!(
+                                    "title: {}, url: {}: couldn't parse i.pub_date {:?}",
+                                    t.clone(),
+                                    url,
+                                    i.pub_date.map(|x| x.replace("UTC", "GMT"))
+                                )
+                            }),
+                    ),
+                })
+                .collect(),
+        })
     } else {
-        bail!("Couldn't read Atom or RSS from input.")
+        bail!("Couldn't read Atom or RSS from url: {}", url)
     }
 }
 
-async fn get_feed_entries(client: &reqwest::Client, url: &str) -> Result<Vec<Entry>> {
+async fn get_feed_entries(client: &reqwest::Client, url: &str) -> Result<Feed> {
     let digest = md5::compute(url);
     let xdg_dirs = xdg::BaseDirectories::with_prefix("prss")?;
     let cache_file = xdg_dirs.find_cache_file(format!("{:x}", digest));
@@ -146,11 +178,11 @@ async fn get_feed_entries(client: &reqwest::Client, url: &str) -> Result<Vec<Ent
             let mut handle = File::open(cache).context("open")?;
             let mut buf = vec![];
             handle.read_to_end(&mut buf)?;
-            read_feed(&buf[..])
+            read_feed(url, &buf[..])
         }
         _ => {
             let content = reqwest::get(url).await?.bytes().await?;
-            let feed = read_feed(&content[..]);
+            let feed = read_feed(url, &content[..]);
             let path = xdg_dirs.place_cache_file(format!("{:x}", digest))?;
             let mut f = File::create(path)?;
             f.write_all(&content[..])?;
@@ -166,7 +198,9 @@ async fn main() -> Result<()> {
         .place_config_file("feeds.txt")
         .expect("cannot create configuration directory");
     let feeds_txt = File::open(feeds_txt).context("feeds.txt")?;
-    let feed_urls = BufReader::new(feeds_txt).lines().map(|l| l.unwrap());
+    let feed_urls: Vec<String> = process_results(BufReader::new(feeds_txt).lines(), |lines| {
+        lines.filter(|line| !line.starts_with('#')).collect()
+    })?;
 
     let screen = AlternateScreen::from(io::stdout().into_raw_mode()?);
     let stdin = io::stdin();
@@ -176,24 +210,19 @@ async fn main() -> Result<()> {
 
     let client = reqwest::Client::new();
 
-    let fetches = futures::stream::iter(feed_urls.map(|url| {
+    let fetches = futures::stream::iter(feed_urls.iter().map(|url| {
         let client = client.clone();
-        async move { get_feed_entries(&client, &url).await }
+        async move { get_feed_entries(&client, url).await }
     }))
     .buffer_unordered(8)
     .collect::<Vec<_>>()
     .await;
-    let mut entries = fetches
-        .into_iter()
-        .collect::<Result<Vec<Vec<Entry>>>>()?
-        .concat();
-
-    entries.sort_by_key(|x| x.date());
-    entries.reverse();
+    let entries = fetches.into_iter().collect::<Result<Vec<Feed>>>()?;
 
     let mut events = stdin.keys();
 
     let mut feedlist = FeedList::new(entries);
+
     loop {
         terminal.draw(|f| {
             let rect = f.size().inner(&Margin {
@@ -204,7 +233,7 @@ async fn main() -> Result<()> {
             let items: Vec<ListItem> = feedlist
                 .items
                 .iter()
-                .map(|i| ListItem::new(i.title().unwrap_or_else(|| String::from(""))))
+                .map(|i| ListItem::new(i.title.clone()))
                 .collect();
 
             let items = List::new(items)
@@ -225,12 +254,11 @@ async fn main() -> Result<()> {
                 feedlist.previous();
             }
             Some(Ok(Key::Char('\n'))) => {
-                if let Some(url) = feedlist.get().link() {
-                    Command::new("xdg-open")
-                        .arg(url)
-                        .status()
-                        .unwrap_or_else(|e| panic!("Failed to open link: {}", e));
-                }
+                let url = feedlist.get().url.clone();
+                Command::new("xdg-open")
+                    .arg(url)
+                    .status()
+                    .unwrap_or_else(|e| panic!("Failed to open link: {}", e));
             }
             Some(Ok(Key::Ctrl('c'))) => break,
             _ => {}
