@@ -155,9 +155,12 @@ fn read_feed(url: &str, content: &[u8]) -> Result<Feed> {
     }
 }
 
-async fn get_feed_entries(client: &reqwest::Client, url: &str) -> Result<Feed> {
+async fn get_feed_entries(
+    client: &reqwest::Client,
+    xdg_dirs: &xdg::BaseDirectories,
+    url: &str,
+) -> Result<Feed> {
     let digest = md5::compute(url);
-    let xdg_dirs = xdg::BaseDirectories::with_prefix("prss")?;
     let cache_file = xdg_dirs.find_cache_file(format!("{:x}", digest));
     let response = client.head(url).send().await?;
     match (
@@ -212,7 +215,8 @@ async fn main() -> Result<()> {
 
     let fetches = futures::stream::iter(feed_urls.iter().map(|url| {
         let client = client.clone();
-        async move { get_feed_entries(&client, url).await }
+        let xdg_dirs = xdg_dirs.clone();
+        async move { get_feed_entries(&client, &xdg_dirs, url).await }
     }))
     .buffer_unordered(8)
     .collect::<Vec<_>>()
