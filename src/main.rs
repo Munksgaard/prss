@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::fs::{metadata, File};
 use std::io;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -155,6 +156,15 @@ fn read_feed(url: &str, content: &[u8]) -> Result<Feed> {
     }
 }
 
+fn get_read_entries(xdg_dirs: &xdg::BaseDirectories) -> Result<HashSet<String>> {
+    if let Some(entries_file) = xdg_dirs.find_cache_file("read_entries.txt".to_string()) {
+        let reader = BufReader::new(File::open(entries_file).context("open")?);
+        process_results(reader.lines(), |lines| lines.collect()).context("lines")
+    } else {
+        Ok(HashSet::new())
+    }
+}
+
 async fn get_feed_entries(
     client: &reqwest::Client,
     xdg_dirs: &xdg::BaseDirectories,
@@ -205,12 +215,6 @@ async fn main() -> Result<()> {
         lines.filter(|line| !line.starts_with('#')).collect()
     })?;
 
-    let screen = AlternateScreen::from(io::stdout().into_raw_mode()?);
-    let stdin = io::stdin();
-    let backend = TermionBackend::new(screen);
-    let mut terminal = Terminal::new(backend)?;
-    terminal.clear()?;
-
     let client = reqwest::Client::new();
 
     let fetches = futures::stream::iter(feed_urls.iter().map(|url| {
@@ -222,6 +226,14 @@ async fn main() -> Result<()> {
     .collect::<Vec<_>>()
     .await;
     let entries = fetches.into_iter().collect::<Result<Vec<Feed>>>()?;
+
+    let mut read_entries = get_read_entries(&xdg_dirs)?;
+
+    let screen = AlternateScreen::from(io::stdout().into_raw_mode()?);
+    let stdin = io::stdin();
+    let backend = TermionBackend::new(screen);
+    let mut terminal = Terminal::new(backend)?;
+    terminal.clear()?;
 
     let mut events = stdin.keys();
 
@@ -237,6 +249,7 @@ async fn main() -> Result<()> {
             let items: Vec<ListItem> = feedlist
                 .items
                 .iter()
+                .filter(|i| !read_entries.contains(&i.url))
                 .map(|i| ListItem::new(i.title.clone()))
                 .collect();
 
@@ -263,6 +276,19 @@ async fn main() -> Result<()> {
                     .arg(url)
                     .status()
                     .unwrap_or_else(|e| panic!("Failed to open link: {}", e));
+            }
+            Some(Ok(Key::Char('r'))) => {
+                read_entries.insert(feedlist.get().url.clone());
+                let mut file = if let Some(entries_file) =
+                    xdg_dirs.find_cache_file("read_entries.txt".to_string())
+                {
+                    use std::fs::OpenOptions;
+
+                    OpenOptions::new().append(true).open(entries_file)?
+                } else {
+                    File::create(xdg_dirs.place_cache_file("read_entries.txt".to_string())?)?
+                };
+                writeln!(file, "{}", &feedlist.get().url)?;
             }
             Some(Ok(Key::Ctrl('c'))) => break,
             _ => {}
